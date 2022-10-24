@@ -45,6 +45,12 @@ from utils.general import (LOGGER, check_file, check_img_size, check_imshow, che
 from utils.plots import Annotator, colors, save_one_box
 
 
+tf_avg = np.load('tf_avg.npy')
+depth_h = 512
+depth_w = 512
+proj = np.fromfile('./depth_lut.bin', dtype=np.float32).reshape((depth_w, depth_h, 2)).transpose((1, 0, 2))
+print("proj.shape:",proj.shape)
+
 def world2pixel_box(x, intrinsic):
     fx = intrinsic[0]
     fy = intrinsic[1]
@@ -304,6 +310,7 @@ class ImageListener:
                 im0 = stacked_img.copy()
                 gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
                 annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+                color_abc = color_or_img.copy()
                 
                 if len(det):
                     det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
@@ -314,9 +321,15 @@ class ImageListener:
                         c = int(cls)
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        
+
+                        center_x = int(xywh[0] * depth_w)
+                        center_y = int(xywh[1] * depth_h)
+                        center = np.array([center_x, center_y])
 
                         annotator.box_label(xyxy, label, color=colors(c,True))
+
+                        color_abc = holo_2D_to_3D(color_abc, proj, center, depth_or_img, holo_color_intrinsic, 0.10,
+                                                  tf_avg)
 
                         
 
