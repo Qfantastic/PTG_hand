@@ -45,11 +45,14 @@ from utils.general import (LOGGER, check_file, check_img_size, check_imshow, che
 from utils.plots import Annotator, colors, save_one_box
 
 
-tf_avg = np.load('tf_avg.npy')
+tf_avg = np.load('./data/tf_avg.npy')
 depth_h = 512
 depth_w = 512
-proj = np.fromfile('./depth_lut.bin', dtype=np.float32).reshape((depth_w, depth_h, 2)).transpose((1, 0, 2))
-print("proj.shape:",proj.shape)
+curr_dir = os.path.dirname(os.path.abspath(__file__))
+lut_file = os.path.join(curr_dir, "./data/depth_lut.bin")
+with open(lut_file, mode="rb") as lut_file:
+    lut = np.frombuffer(lut_file.read(), dtype="f")
+    lut = np.reshape(lut, (-1, 3))
 
 def world2pixel_box(x, intrinsic):
     fx = intrinsic[0]
@@ -104,30 +107,63 @@ def bounding_box_to_pixel(x, intrinsic, range_box):
     return bounding_box_p
 
 
-def holo_2D_to_3D(abc, proj, center, depth_image, intrinsic, range_box, tf):
-    h0 = int(center[1])
-    w0 = int(center[0])
-    u = int(center[1])
-    v = int(proj.shape[1] - center[0])
-    x_unit = proj[u, v, 0]
-    y_unit = proj[u, v, 1]
+def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, abc_or):
+    height_color = int(abc.shape[0])
+    width_color = int(abc.shape[1])
 
-    z = depth_image[h0, w0] / 1000
-
-    c = z / math.sqrt(1 + math.pow(x_unit, 2) + math.pow(y_unit, 2))
-
-    x = x_unit * c
-    y = y_unit * c
-    real_z = math.sqrt(math.pow(z, 2) - math.pow(x, 2) - math.pow(y, 2))
-    print('z', real_z)
-
-    hand_center_3D_depth = np.array([x, y, real_z, 1])
+    depth_image = depth_image_or / 1000
+    depth_image = np.tile(depth_image.flatten().reshape((-1, 1)), (1, 3))
+    points = depth_image * lut
+    n_center = center[1] * depth_w + center[0]
+    hand_center_3D_depth = np.append(points[n_center],1)
     hand_center_3D_color = np.dot(tf, hand_center_3D_depth)[0:3]
+
     bounding_box_p = bounding_box_to_pixel(hand_center_3D_color, intrinsic, range_box)
     center_p = world2pixel(hand_center_3D_color, intrinsic)
+
     image_to_draw = abc.copy()
     cv2.rectangle(image_to_draw, (int(bounding_box_p[0,0]),int(bounding_box_p[0,1])),
                   (int(bounding_box_p[2,0]),int(bounding_box_p[2,1])),(0,255,0),1)
+
+    c =0.75
+
+    x1 = int(bounding_box_p[0][0])
+    y1 = int(bounding_box_p[0][1])
+    x2 = int(bounding_box_p[2][0])
+    y2 = int(bounding_box_p[2][1])
+
+    w = x2 - x1
+    h = y2 - y1
+
+    if ((width_color-x1)>c*w and (height_color-y1)>c*h and x2>c*w and y2>c*h):
+        crop_color = abc_or[y1:y2,x1:x2]
+
+
+
+
+    # h0 = int(center[1])
+    # w0 = int(center[0])
+    # u = int(center[1])
+    # v = int(proj.shape[1] - center[0])
+    # x_unit = proj[u, v, 0]
+    # y_unit = proj[u, v, 1]
+    #
+    # z = depth_image[h0, w0] / 1000
+    #
+    # c = z / math.sqrt(1 + math.pow(x_unit, 2) + math.pow(y_unit, 2))
+    #
+    # x = x_unit * c
+    # y = y_unit * c
+    # real_z = math.sqrt(math.pow(z, 2) - math.pow(x, 2) - math.pow(y, 2))
+    # print('z', real_z)
+
+    # hand_center_3D_depth = np.array([x, y, real_z, 1])
+    # hand_center_3D_color = np.dot(tf, hand_center_3D_depth)[0:3]
+    # bounding_box_p = bounding_box_to_pixel(hand_center_3D_color, intrinsic, range_box)
+    # center_p = world2pixel(hand_center_3D_color, intrinsic)
+    # image_to_draw = abc.copy()
+    # cv2.rectangle(image_to_draw, (int(bounding_box_p[0,0]),int(bounding_box_p[0,1])),
+    #               (int(bounding_box_p[2,0]),int(bounding_box_p[2,1])),(0,255,0),1)
 
     print('center_p', center_p)
     return image_to_draw
@@ -174,7 +210,8 @@ class ImageListener:
         # initialize a node
         rospy.init_node(self.node_id, anonymous=True)
 
-        self.box_pub = rospy.Publisher('box_label', Image, queue_size=10)    
+        self.box_pub = rospy.Publisher('box_label', Image, queue_size=10)
+        self.color_box_pub = rospy.Publisher('color_box_label', Image, queue_size=10)
         self.holo_subs = [
             message_filters.Subscriber(t, Image, queue_size=10)
             for t in topics[:-1]       
@@ -238,7 +275,7 @@ class ImageListener:
 
         if self.synced_msgs is not None:
             depth_msg, color_msg, caminfo_msg = self.synced_msgs
-            depth_or_img = self.cv_bridge.imgmsg_to_cv2(depth_msg,depth_msg.encoding)
+            depth_or_img = self.cv_bridge.imgmsg_to_cv2(depth_msg,depth_msg.encoding).astype('uint16')
             depth_frame_id = depth_msg.header.frame_id
             depth_frame_stamp = depth_msg.header.stamp
 
@@ -327,9 +364,10 @@ class ImageListener:
                         center = np.array([center_x, center_y])
 
                         annotator.box_label(xyxy, label, color=colors(c,True))
+                        holo_color_intrinsic = np.array([K_mat[0][0], K_mat[1][1], K_mat[0][2], K_mat[1][2]])
 
-                        color_abc = holo_2D_to_3D(color_abc, proj, center, depth_or_img, holo_color_intrinsic, 0.10,
-                                                  tf_avg)
+                        color_abc = holo_2D_to_3D(color_abc, lut, center, depth_or_img, holo_color_intrinsic, 0.10,
+                                                  tf_avg,color_or_img)
 
                         
 
@@ -365,6 +403,12 @@ class ImageListener:
                 bbox_msg.header.frame_id = depth_frame_id
                 bbox_msg.encoding = 'rgb8'
                 self.box_pub.publish(bbox_msg)
+
+                color_bbox_msg = self.cv_bridge.cv2_to_imgmsg(color_abc)
+                color_bbox_msg.header.stamp = depth_frame_stamp
+                color_bbox_msg.header.frame_id = depth_frame_id
+                color_bbox_msg.encoding = 'rgb8'
+                self.color_box_pub.publish(color_bbox_msg)
 
       
 
