@@ -4,6 +4,7 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.utils.data
 import torch.optim as optim
+from torchvision import datasets, models, transforms
 
 import message_filters
 import cv2
@@ -14,7 +15,7 @@ import rospy
 
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
-
+import PIL
 # lock = threading.Lock()
 
 
@@ -44,7 +45,8 @@ from utils.general import (LOGGER, check_file, check_img_size, check_imshow, che
                            increment_path, non_max_suppression, print_args, scale_coords, strip_optimizer, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 
-
+class_names = np.array(['coffee_bean', 'dropper', 'filter', 'grinder', 'grinder_lip', 'kettle',
+                        'kettle_lip', 'measure_cup', 'mug', 'only_hand', 'thermometer', 'weighter'])
 tf_avg = np.load('./data/tf_avg.npy')
 depth_h = 512
 depth_w = 512
@@ -107,7 +109,7 @@ def bounding_box_to_pixel(x, intrinsic, range_box):
     return bounding_box_p
 
 
-def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, abc_or):
+def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, abc_or,model_cls, device, pre_process):
     height_color = int(abc.shape[0])
     width_color = int(abc.shape[1])
 
@@ -122,8 +124,8 @@ def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, ab
     center_p = world2pixel(hand_center_3D_color, intrinsic)
 
     image_to_draw = abc.copy()
-    cv2.rectangle(image_to_draw, (int(bounding_box_p[0,0]),int(bounding_box_p[0,1])),
-                  (int(bounding_box_p[2,0]),int(bounding_box_p[2,1])),(0,255,0),1)
+    # cv2.rectangle(image_to_draw, (int(bounding_box_p[0,0]),int(bounding_box_p[0,1])),
+    #               (int(bounding_box_p[2,0]),int(bounding_box_p[2,1])),(0,255,0),1)
 
     c =0.75
 
@@ -136,34 +138,23 @@ def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, ab
     h = y2 - y1
 
     if ((width_color-x1)>c*w and (height_color-y1)>c*h and x2>c*w and y2>c*h):
-        crop_color = abc_or[y1:y2,x1:x2]
+        annotator = Annotator(abc_or.copy(), line_width=3)
+        crop_color = abc_or[max(y1,0):min(y2,height_color),max(x1,0):min(x2,width_color)]
 
 
+        crop_color = PIL.Image.fromarray(crop_color)
+        crop_color = pre_process(crop_color)
+        crop_color = crop_color.unsqueeze(0)
+        crop_color = crop_color.to(device)
+        outputs = model_cls(crop_color)
+        _, pre_crop = torch.max(outputs.data, 1)
+        class_index = int(pre_crop.cpu().numpy())
+        print(class_names[class_index])
+        cv2.rectangle(image_to_draw, (max(x1,0),max(y1,0)),
+                      (min(x2,width_color),min(y2,height_color)),(0,0,255),3)
+        cv2.putText(image_to_draw, class_names[class_index], (max(x1,0),max(y1,0)), cv2.FONT_HERSHEY_SIMPLEX,
+                    1,(255,0,0),3,cv2.LINE_AA)
 
-
-    # h0 = int(center[1])
-    # w0 = int(center[0])
-    # u = int(center[1])
-    # v = int(proj.shape[1] - center[0])
-    # x_unit = proj[u, v, 0]
-    # y_unit = proj[u, v, 1]
-    #
-    # z = depth_image[h0, w0] / 1000
-    #
-    # c = z / math.sqrt(1 + math.pow(x_unit, 2) + math.pow(y_unit, 2))
-    #
-    # x = x_unit * c
-    # y = y_unit * c
-    # real_z = math.sqrt(math.pow(z, 2) - math.pow(x, 2) - math.pow(y, 2))
-    # print('z', real_z)
-
-    # hand_center_3D_depth = np.array([x, y, real_z, 1])
-    # hand_center_3D_color = np.dot(tf, hand_center_3D_depth)[0:3]
-    # bounding_box_p = bounding_box_to_pixel(hand_center_3D_color, intrinsic, range_box)
-    # center_p = world2pixel(hand_center_3D_color, intrinsic)
-    # image_to_draw = abc.copy()
-    # cv2.rectangle(image_to_draw, (int(bounding_box_p[0,0]),int(bounding_box_p[0,1])),
-    #               (int(bounding_box_p[2,0]),int(bounding_box_p[2,1])),(0,255,0),1)
 
     print('center_p', center_p)
     return image_to_draw
@@ -255,9 +246,9 @@ class ImageListener:
 
     
 
-    def run_network(self, model, index, imgsz=(640, 640), augment=False, visualize=False, conf_thres=0.45,
-                    iou_thres=0.45, classes=None, agnostic_nms=False, max_det=1000,line_thickness=3,hide_labels=False,
-                    hide_conf=False,):
+    def run_network(self, model, index, model_cls, device , pre_process,imgsz=(640, 640), augment=False, visualize=False, conf_thres=0.45,
+                    iou_thres=0.4, classes=None, agnostic_nms=False, max_det=1000,line_thickness=3,hide_labels=False,
+                    hide_conf=False):
 
         # with lock:
         #     # if listener.im is None:
@@ -342,13 +333,15 @@ class ImageListener:
 
             print(pred)
 
+
+
             for i, det in enumerate(pred):
 
                 im0 = stacked_img.copy()
                 gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
                 annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-                color_abc = color_or_img.copy()
-                
+                color_abc = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
+                color_or_img_rgb = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
                 if len(det):
                     det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
 
@@ -362,14 +355,15 @@ class ImageListener:
                         center_x = int(xywh[0] * depth_w)
                         center_y = int(xywh[1] * depth_h)
                         center = np.array([center_x, center_y])
-
+                        print('xyxy:',xyxy)
                         annotator.box_label(xyxy, label, color=colors(c,True))
                         holo_color_intrinsic = np.array([K_mat[0][0], K_mat[1][1], K_mat[0][2], K_mat[1][2]])
 
-                        color_abc = holo_2D_to_3D(color_abc, lut, center, depth_or_img, holo_color_intrinsic, 0.10,
-                                                  tf_avg,color_or_img)
+                        color_abc = holo_2D_to_3D(color_abc, lut, center, depth_or_img, holo_color_intrinsic, 0.08,
+                                                  tf_avg,color_or_img_rgb,model_cls, device, pre_process)
 
-                        
+                        # color_xyxy , color_label, color_cls = holo_2D_to_3D(color_abc, lut, center, depth_or_img, holo_color_intrinsic, 0.10,
+                        #                           tf_avg, color_or_img_rgb, model_cls, device, pre_process)
 
                 im0 = annotator.result()
 
@@ -468,7 +462,14 @@ if __name__ == '__main__':
 
     device = select_device(args.device)
     model = DetectMultiBackend(args.weights, device=device, dnn=args.dnn, data=args.data, fp16=args.half)
-
+    print("Loading the Classification Model......")
+    model_cls = torch.load("./test/weights_cls/whole_model_1028.pt")
+    model_cls.eval()
+    pre_process = transforms.Compose([transforms.Resize(224),
+                                      transforms.CenterCrop(224),
+                                      transforms.RandomHorizontalFlip(),
+                                      transforms.ToTensor(),
+                                      transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
 
 
@@ -482,6 +483,6 @@ if __name__ == '__main__':
     )
     index = 0
     while not rospy.is_shutdown():
-       listener.run_network(model, index=index ,augment=args.augment,)
+       listener.run_network(model,index=index ,model_cls = model_cls, device =device , pre_process = pre_process,augment=args.augment)
        index = index + 1
     #listener.write_video('test_box.mp4', 'test_label.mp4')
