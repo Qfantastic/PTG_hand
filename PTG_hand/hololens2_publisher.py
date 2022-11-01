@@ -382,7 +382,7 @@ class HoloLensMessagePublisher:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--host", help="IP address of HoloLens.", default="192.168.0.210", type=str
+        "--host", help="IP address of HoloLens.", default="192.168.0.220", type=str
     )
     parser.add_argument(
         "--sensor_type",
