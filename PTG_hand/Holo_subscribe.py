@@ -124,8 +124,7 @@ def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, ab
     center_p = world2pixel(hand_center_3D_color, intrinsic)
 
     image_to_draw = abc.copy()
-    # cv2.rectangle(image_to_draw, (int(bounding_box_p[0,0]),int(bounding_box_p[0,1])),
-    #               (int(bounding_box_p[2,0]),int(bounding_box_p[2,1])),(0,255,0),1)
+ 
 
     c =0.75
 
@@ -158,24 +157,6 @@ def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, ab
 
     print('center_p', center_p)
     return image_to_draw
-    # plt.figure()
-    # plt.imshow(abc)
-    # plt.plot(center_p[0], center_p[1], 'r+')
-    #
-    # for i in range(3):
-    #     plt.plot([bounding_box_p[i][0], bounding_box_p[i + 1][0]],
-    #              [bounding_box_p[i][1], bounding_box_p[i + 1][1]], color='green')
-    #
-    # plt.plot([bounding_box_p[0][0], bounding_box_p[3][0]],
-    #          [bounding_box_p[0][1], bounding_box_p[3][1]], color='green')
-    #
-    # save_path = './result_0827_' + args.folder + '/test_holo_color/'
-    #
-    # if not os.path.isdir(save_path):
-    #     os.makedirs(save_path)
-    # plt.savefig(os.path.join(save_path, 'result') + str(n_image) + '.png', dpi=200)
-    # print('saving image %i' % n_image)
-    # plt.close()
 
 class ImageListener:
 
@@ -207,8 +188,7 @@ class ImageListener:
         # self.holo_depth = message_filters.Subscriber(topics[0], Image, queue_size=10)
         # self.holo_color = message_filters.Subscriber(topics[1], Image, queue_size=10)
 
-        # self.box_pub.publish(self.holo_depth)
-        # self.color_box_pub.publish(self.holo_color)
+
 
         self.holo_subs = [
             message_filters.Subscriber(t, Image, queue_size=10)
@@ -216,11 +196,9 @@ class ImageListener:
         ]
 
 
-
         self.holo_subs.append(
             message_filters.Subscriber(topics[-1], CameraInfo, queue_size=10)
         )
-
 
         ts = message_filters.ApproximateTimeSynchronizer(
             self.holo_subs, 
@@ -231,19 +209,6 @@ class ImageListener:
 
     def ts_callback(self, *msg):
         self.synced_msgs = msg
-        # if depth.encoding == '32FC1':
-        #     print('32')
-        #     depth_cv = self.cv_bridge.imgmsg_to_cv2(depth)
-        # elif depth.encoding == '16UC1':
-        #     depth_cv = self.cv_bridge.imgmsg_to_cv2(depth)
-        #     #depth_cv = self.cv_bridge.imgmsg_to_cv2(depth).copy().astype(np.float32)
-        #     #depth_cv = depth_cv/1000.0
-        # else:
-        #     print('else')
-        #     rospy.logerr_throttle(
-        #         1, 'Unsupported depth type. Expected 16UC1 or 32FC1, got {}'.format(
-        #             depth.encoding))
-        #     return
 
       
 
@@ -282,41 +247,20 @@ class ImageListener:
             depth_frame_stamp = depth_msg.header.stamp
 
             color_or_img = self.cv_bridge.imgmsg_to_cv2(color_msg,color_msg.encoding)
-            color_frame_id = color_msg.header.frame_id
-            color_frame_stamp = color_msg.header.stamp
+            # color_frame_id = color_msg.header.frame_id
+            # color_frame_stamp = color_msg.header.stamp
 
+            # get the intrinsic matrix of rgb camera
             K_mat = np.array(caminfo_msg.P, dtype=np.float32).reshape((3,4))[:3,:3]
             print(K_mat)
 
-        # if(depth_or_img.ndim == 2):
-            print('saving images ',index)
-            #cv2.imwrite('test/images2/'+str(index)+'.png',depth_or_img)
-
-            # box_msg = self.cv_bridge.cv2_to_imgmsg(depth_or_img)
-            # box_msg.header.stamp = depth_frame_stamp
-            # box_msg.header.frame_id = depth_frame_id
-            # box_msg.encoding = '16UC1'
-            # self.box_pub.publish(box_msg)
-
+            # Do the normalization
             print('max:', np.max(depth_or_img), 'min:', np.min(depth_or_img))
             range_img = np.max(depth_or_img) - np.min(depth_or_img)
             depth_img = ((depth_or_img/range_img)*255).astype('uint8')
-            # depth_or_img[depth_or_img > 1000] = 0
-            # depth_img = ((depth_or_img/1000.0)*255).astype('uint8')
-
-
-            #print(depth_img.ndim)
-
             stacked_img = np.stack((depth_img,) * 3, axis=-1)
             print('max:', np.max(stacked_img), 'min:', np.min(stacked_img))
-
-            #cv2.imwrite('test/images_holo_0/'+str(index)+'.png',stacked_img)
-
-            #print(stacked_img.shape)
             img = letterbox(stacked_img, imgsz, stride=stride, auto=pt)[0]
-
-
-
             img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
             #print('max:', np.max(img), 'min:', np.min(img))
             img = np.ascontiguousarray(img)
@@ -330,23 +274,21 @@ class ImageListener:
             img /= 255  # 0 - 255 to 0.0 - 1.0
 
 
-
             if len(img.shape) == 3:
                 img = img[None]
             print(img.shape)
 
+            # predict the hand on depth images
             pred = model(img, augment=augment, visualize=visualize)
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
 
             print('prediction:')
 
-
             print(pred)
 
             im0 = stacked_img.copy()
             for i, det in enumerate(pred):
-
 
                 gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
                 annotator = Annotator(im0, line_width=line_thickness, example=str(names))
@@ -369,6 +311,7 @@ class ImageListener:
                         annotator.box_label(xyxy, label, color=colors(c,True))
                         holo_color_intrinsic = np.array([K_mat[0][0], K_mat[1][1], K_mat[0][2], K_mat[1][2]])
 
+                        # color_bounding_box
                         color_abc = holo_2D_to_3D(color_abc, lut, center, depth_or_img, holo_color_intrinsic, 0.08,
                                                   tf_avg,color_or_img_rgb,model_cls, device, pre_process)
 
@@ -377,31 +320,7 @@ class ImageListener:
 
                 im0 = annotator.result()
 
-                #cv2.imwrite('test/images_holo_0_result/'+str(index)+'.png', im0)
-
-                        # xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
-                        # x_center = xywh[0]*448
-                        # y_center = xywh[1]*450
-                        # width = xywh[2]*448
-                        # height = xywh[3]*450
-                        #
-                        # x1 = int(x_center-(width/2))
-                        # y1 = int(y_center-(height/2))
-                        #
-                        # x2 = int(x_center+(width/2))
-                        # y2 = int(y_center+(height/2))
-
-
-                        #depth_img8 = (depth_or_img / 255).astype('uint8')
-                        # depth_img8UC3= np.stack((depth_img8,) * 3, axis=-1)
-                        #image_to_draw = cv2.cvtColor(depth_img8, cv2.COLOR_GRAY2RGB)
-                        #image_to_draw = stacked_img.copy()   ************
-                        #print(image_to_draw.shape)
-
-                        #cv2.rectangle(image_to_draw, (x1, y1), (x2,y2), (255, 0, 0), 1)
-
-
-                        #bbox_msg = self.cv_bridge.cv2_to_imgmsg(image_to_draw.astype(np.uint8))
+                # publish
                 bbox_msg = self.cv_bridge.cv2_to_imgmsg(im0)
                 bbox_msg.header.stamp = depth_frame_stamp
                 bbox_msg.header.frame_id = depth_frame_id
@@ -415,23 +334,6 @@ class ImageListener:
                 self.color_box_pub.publish(color_bbox_msg)
 
       
-
-                        # cv2.rectangle()
-
-
-
-
-
-       # print(depth_img[0])
-
-
-
-        #abc = depth_img.reshape((450,448,3))
-        # print(abc)
-        #img = letterbox(depth_img, img_size, stride=stride, auto=pt)[0]
-
-
-
 
 
 
