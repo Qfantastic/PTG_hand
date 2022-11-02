@@ -203,13 +203,24 @@ class ImageListener:
 
         self.box_pub = rospy.Publisher('box_label', Image, queue_size=10)
         self.color_box_pub = rospy.Publisher('color_box_label', Image, queue_size=10)
+
+        # self.holo_depth = message_filters.Subscriber(topics[0], Image, queue_size=10)
+        # self.holo_color = message_filters.Subscriber(topics[1], Image, queue_size=10)
+
+        # self.box_pub.publish(self.holo_depth)
+        # self.color_box_pub.publish(self.holo_color)
+
         self.holo_subs = [
             message_filters.Subscriber(t, Image, queue_size=10)
             for t in topics[:-1]       
         ]
+
+
+
         self.holo_subs.append(
             message_filters.Subscriber(topics[-1], CameraInfo, queue_size=10)
         )
+
 
         ts = message_filters.ApproximateTimeSynchronizer(
             self.holo_subs, 
@@ -333,11 +344,10 @@ class ImageListener:
 
             print(pred)
 
-
-
+            im0 = stacked_img.copy()
             for i, det in enumerate(pred):
 
-                im0 = stacked_img.copy()
+
                 gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
                 annotator = Annotator(im0, line_width=line_thickness, example=str(names))
                 color_abc = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
@@ -463,7 +473,7 @@ if __name__ == '__main__':
     device = select_device(args.device)
     model = DetectMultiBackend(args.weights, device=device, dnn=args.dnn, data=args.data, fp16=args.half)
     print("Loading the Classification Model......")
-    model_cls = torch.load("./test/weights_cls/whole_model_1028.pt")
+    model_cls = torch.load("./test/weights_cls/whole_model_1101.pt")
     model_cls.eval()
     pre_process = transforms.Compose([transforms.Resize(224),
                                       transforms.CenterCrop(224),
