@@ -5,10 +5,12 @@ import torch.backends.cudnn as cudnn
 import torch.utils.data
 import torch.optim as optim
 from torchvision import datasets, models, transforms
+import copy
+
 
 import message_filters
 import cv2
-# import threading
+import threading
 import argparse
 import numpy as np
 import rospy
@@ -16,7 +18,10 @@ import rospy
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 import PIL
-# lock = threading.Lock()
+from detectron2 import model_zoo
+from detectron2.config import get_cfg
+from detectron2.engine import DefaultPredictor
+lock = threading.Lock()
 
 
 
@@ -47,6 +52,10 @@ from utils.plots import Annotator, colors, save_one_box
 
 class_names = np.array(['coffee_bean', 'dropper', 'filter', 'grinder', 'grinder_lip', 'kettle',
                         'kettle_lip', 'measure_cup', 'mug', 'only_hand', 'thermometer', 'weighter'])
+
+object_list = ['kettle', 'measuring_cup', 'mug', 'kettle_lid', 'filter_cone','paper_filter_circle',
+               'paper_filter_half', 'paper_filter_quarter', 'kitchen_scale',
+               'coffee_beans', 'coffee_grinder', 'coffee_grinder_lid', 'coffee_grounds','thermometer']
 tf_avg = np.load('./data/tf_avg.npy')
 depth_h = 512
 depth_w = 512
@@ -109,7 +118,7 @@ def bounding_box_to_pixel(x, intrinsic, range_box):
     return bounding_box_p
 
 
-def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, abc_or,model_cls, device, pre_process):
+def holo_2D_to_3D(abc,im, lut, center, depth_image_or, intrinsic, range_box, tf, abc_or,model_cls, device, pre_process):
     height_color = int(abc.shape[0])
     width_color = int(abc.shape[1])
 
@@ -124,7 +133,8 @@ def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, ab
     center_p = world2pixel(hand_center_3D_color, intrinsic)
 
     image_to_draw = abc.copy()
- 
+
+
 
     c =0.75
 
@@ -137,7 +147,6 @@ def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, ab
     h = y2 - y1
 
     if ((width_color-x1)>c*w and (height_color-y1)>c*h and x2>c*w and y2>c*h):
-        annotator = Annotator(abc_or.copy(), line_width=3)
         crop_color = abc_or[max(y1,0):min(y2,height_color),max(x1,0):min(x2,width_color)]
 
 
@@ -160,7 +169,7 @@ def holo_2D_to_3D(abc, lut, center, depth_image_or, intrinsic, range_box, tf, ab
 
 class ImageListener:
 
-    def __init__(self, topics, node_id="image_listener",slop_seconds=0.1):
+    def __init__(self, topics, node_id="image_listener",slop_seconds=0.2):
 
         self.cv_bridge = CvBridge()
         self.node_id = node_id
@@ -169,11 +178,14 @@ class ImageListener:
         #self.queue_size = 2 * len(topics)
         self.queue_size = 3
         self.slop_seconds = slop_seconds
-        # self.im = None
+        self.color = None
         # self.depth_or = None
-        # self.depth = None
-        # self.depth_frame_id = None
-        # self.depth_frame_stamp = None
+        self.depth = None
+        self.depth_frame_id = None
+        self.depth_frame_stamp = None
+        self.rgb_frame_id = None
+        self.rgb_frame_stamp = None
+        self.K_mat = None
         self.empty_label = np.zeros((176, 176, 3), dtype=np.uint8)
         
         self.synced_msgs = None
@@ -208,11 +220,30 @@ class ImageListener:
         ts.registerCallback(self.ts_callback)
 
     def ts_callback(self, *msg):
-        self.synced_msgs = msg
+
+        # self.synced_msgs = msg
+
+
+        depth_msg, color_msg, caminfo_msg = msg
+        depth_cv = self.cv_bridge.imgmsg_to_cv2(depth_msg, depth_msg.encoding).astype('uint16')
+        color_cv = self.cv_bridge.imgmsg_to_cv2(color_msg, color_msg.encoding)
+        # get the intrinsic matrix of rgb camera
+        K_mat = np.array(caminfo_msg.P, dtype=np.float32).reshape((3, 4))[:3, :3]
+
 
       
 
-        # with lock:
+        with lock:
+            self.color = color_cv.copy()
+            self.depth = depth_cv.copy()
+            self.rgb_frame_id = color_msg.header.frame_id
+            self.rgb_frame_stamp = color_msg.header.stamp
+            self.depth_frame_id = depth_msg.header.frame_id
+            self.depth_frame_stamp = depth_msg.header.stamp
+            self.K_mat = K_mat
+
+
+
      
         #     self.depth_or = depth_cv.copy()
         #     #self.depth = depth_cv.copy()
@@ -222,15 +253,26 @@ class ImageListener:
 
     
 
-    def run_network(self, model, index, model_cls, device , pre_process,imgsz=(640, 640), augment=False, visualize=False, conf_thres=0.45,
+    def run_network(self, model, index, model_cls, model_obj ,device , pre_process,imgsz=(640, 640), augment=False, visualize=False, conf_thres=0.4,
                     iou_thres=0.4, classes=None, agnostic_nms=False, max_det=1000,line_thickness=3,hide_labels=False,
                     hide_conf=False):
 
-        # with lock:
-        #     # if listener.im is None:
-        #     #     return
-        #     if self.depth_or is None:
-        #         return
+        with lock:
+            # if listener.im is None:
+            #     return
+            if self.depth is None:
+                return
+
+            depth_or_img = self.depth.copy()
+            depth_frame_id = self.depth_frame_id
+            depth_frame_stamp = self.depth_frame_stamp
+
+            color_or_img = self.color.copy()
+            color_frame_id = self.rgb_frame_id
+            color_frame_stamp = self.depth_frame_stamp
+
+            K_mat = self.K_mat
+
    
         #     depth_or_img = np.array(self.depth_or).copy()
         #     #depth_img = np.array(self.depth_or).copy()
@@ -240,26 +282,27 @@ class ImageListener:
         stride, names, pt = model.stride, model.names, model.pt
         imgsz = check_img_size(imgsz, s=stride)
 
-        if self.synced_msgs is not None:
-            depth_msg, color_msg, caminfo_msg = self.synced_msgs
-            depth_or_img = self.cv_bridge.imgmsg_to_cv2(depth_msg,depth_msg.encoding).astype('uint16')
-            depth_frame_id = depth_msg.header.frame_id
-            depth_frame_stamp = depth_msg.header.stamp
-
-            color_or_img = self.cv_bridge.imgmsg_to_cv2(color_msg,color_msg.encoding)
-            # color_frame_id = color_msg.header.frame_id
-            # color_frame_stamp = color_msg.header.stamp
-
-            # get the intrinsic matrix of rgb camera
-            K_mat = np.array(caminfo_msg.P, dtype=np.float32).reshape((3,4))[:3,:3]
-            print(K_mat)
+        # if self.synced_msgs is not None:
+        if (depth_or_img.ndim == 2):
+            # depth_msg, color_msg, caminfo_msg = self.synced_msgs
+            # depth_or_img = self.cv_bridge.imgmsg_to_cv2(depth_msg,depth_msg.encoding).astype('uint16')
+            # depth_frame_id = depth_msg.header.frame_id
+            # depth_frame_stamp = depth_msg.header.stamp
+            #
+            # color_or_img = self.cv_bridge.imgmsg_to_cv2(color_msg,color_msg.encoding)
+            # # color_frame_id = color_msg.header.frame_id
+            # # color_frame_stamp = color_msg.header.stamp
+            #
+            # # get the intrinsic matrix of rgb camera
+            # K_mat = np.array(caminfo_msg.P, dtype=np.float32).reshape((3,4))[:3,:3]
+            # # print(K_mat)
 
             # Do the normalization
-            print('max:', np.max(depth_or_img), 'min:', np.min(depth_or_img))
+            # print('max:', np.max(depth_or_img), 'min:', np.min(depth_or_img))
             range_img = np.max(depth_or_img) - np.min(depth_or_img)
             depth_img = ((depth_or_img/range_img)*255).astype('uint8')
             stacked_img = np.stack((depth_img,) * 3, axis=-1)
-            print('max:', np.max(stacked_img), 'min:', np.min(stacked_img))
+            # print('max:', np.max(stacked_img), 'min:', np.min(stacked_img))
             img = letterbox(stacked_img, imgsz, stride=stride, auto=pt)[0]
             img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
             #print('max:', np.max(img), 'min:', np.min(img))
@@ -276,7 +319,7 @@ class ImageListener:
 
             if len(img.shape) == 3:
                 img = img[None]
-            print(img.shape)
+            # print(img.shape)
 
             # predict the hand on depth images
             pred = model(img, augment=augment, visualize=visualize)
@@ -285,15 +328,44 @@ class ImageListener:
 
             print('prediction:')
 
-            print(pred)
+            # print(pred)
 
-            im0 = stacked_img.copy()
+
+
+            outputs = predictor(color_or_img)
+            output_fields = outputs["instances"].to("cpu")._fields
+
+            pred_boxes = output_fields['pred_boxes'].tensor.numpy()
+            pred_boxes_shape = pred_boxes.shape
+            pred_classes = output_fields['pred_classes'].numpy().reshape(pred_boxes_shape[0], 1)
+            scores = output_fields['scores'].numpy().reshape(pred_boxes_shape[0], 1)
+
+            answer = copy.deepcopy(pred_boxes)
+            answer = np.concatenate((answer, pred_classes), axis=1)
+            answer = np.concatenate((answer, scores), axis=1)
+
+
+            color_or_img_rgb = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
+            image_draw = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
+
+            for i in range(answer.shape[0]):
+                # cv2.rectangle(image_draw, (int(answer[i][0]), int(answer[i][1])),
+                #               (int(answer[i][2]), int(answer[i][3])), (0, 0, 255), 3)
+                center_obj = np.array([int((answer[i][0] + answer[i][2]) / 2), int((answer[i][1] + answer[i][3]) / 2)])
+                textsize = cv2.getTextSize(object_list[int(answer[i][4])], cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+                cv2.putText(image_draw, object_list[int(answer[i][4])],
+                            (int(center_obj[0] - 0.5 * textsize[0]), int(center_obj[1] - 0.5 * textsize[1])),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1, (0, 0, 255), 2, cv2.LINE_AA)
+
+
             for i, det in enumerate(pred):
-
+                im0 = stacked_img.copy()
                 gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
                 annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-                color_abc = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
-                color_or_img_rgb = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
+                #color_abc = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
+                #color_or_img_rgb = cv2.cvtColor(color_or_img.copy(), cv2.COLOR_BGR2RGB)
+
                 if len(det):
                     det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
 
@@ -312,8 +384,12 @@ class ImageListener:
                         holo_color_intrinsic = np.array([K_mat[0][0], K_mat[1][1], K_mat[0][2], K_mat[1][2]])
 
                         # color_bounding_box
-                        color_abc = holo_2D_to_3D(color_abc, lut, center, depth_or_img, holo_color_intrinsic, 0.08,
-                                                  tf_avg,color_or_img_rgb,model_cls, device, pre_process)
+                        # color_abc = holo_2D_to_3D(color_abc,color_or_img, lut, center, depth_or_img, holo_color_intrinsic, 0.08,
+                        #                           tf_avg,color_or_img_rgb,model_cls, device, pre_process)
+
+                        image_draw = holo_2D_to_3D(image_draw, color_or_img, lut, center, depth_or_img,
+                                                  holo_color_intrinsic, 0.08,
+                                                  tf_avg, color_or_img_rgb, model_cls, device, pre_process)
 
                         # color_xyxy , color_label, color_cls = holo_2D_to_3D(color_abc, lut, center, depth_or_img, holo_color_intrinsic, 0.10,
                         #                           tf_avg, color_or_img_rgb, model_cls, device, pre_process)
@@ -327,7 +403,7 @@ class ImageListener:
                 bbox_msg.encoding = 'rgb8'
                 self.box_pub.publish(bbox_msg)
 
-                color_bbox_msg = self.cv_bridge.cv2_to_imgmsg(color_abc)
+                color_bbox_msg = self.cv_bridge.cv2_to_imgmsg(image_draw)
                 color_bbox_msg.header.stamp = depth_frame_stamp
                 color_bbox_msg.header.frame_id = depth_frame_id
                 color_bbox_msg.encoding = 'rgb8'
@@ -375,13 +451,39 @@ if __name__ == '__main__':
     device = select_device(args.device)
     model = DetectMultiBackend(args.weights, device=device, dnn=args.dnn, data=args.data, fp16=args.half)
     print("Loading the Classification Model......")
-    model_cls = torch.load("./test/weights_cls/whole_model_1101.pt")
+    model_cls = torch.load("./test/weights_cls/whole_model_1103_3.pt")
     model_cls.eval()
     pre_process = transforms.Compose([transforms.Resize(224),
-                                      transforms.CenterCrop(224),
-                                      transforms.RandomHorizontalFlip(),
                                       transforms.ToTensor(),
-                                      transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+                                      transforms.Normalize([0.5441, 0.4877, 0.3888], [0.1876, 0.1974, 0.1735])
+                                      # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                                      ])
+
+    cfg = get_cfg()
+    cfg.OUTPUT_DIR = 'model_output'
+
+    config_name = "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"
+    cfg.merge_from_file(model_zoo.get_config_file(config_name))
+    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(config_name)
+    cfg.DATASETS.TEST = ()
+    cfg.DATASETS.TRAIN = ('my_dataset',)
+
+    cfg.DATALOADER.NUM_WORKERS = 1
+    cfg.SOLVER.IMS_PER_BATCH = 20
+    cfg.SOLVER.BASE_LR = 0.00025  # pick a good LR
+    cfg.SOLVER.MAX_ITER = 10000
+    cfg.SOLVER.CHECKPOINT_PERIOD = 100000  # Small value=Frequent save need a lot of storage.
+    cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 14
+
+    cfg.MODEL.WEIGHTS = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
+
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(0.3)
+
+    cfg.DATASETS.TEST = ("my_test_dataset",)
+
+    predictor = DefaultPredictor(cfg)
+
 
 
 
@@ -395,6 +497,6 @@ if __name__ == '__main__':
     )
     index = 0
     while not rospy.is_shutdown():
-       listener.run_network(model,index=index ,model_cls = model_cls, device =device , pre_process = pre_process,augment=args.augment)
+       listener.run_network(model,index=index ,model_cls = model_cls, model_obj = predictor,device =device , pre_process = pre_process,augment=args.augment)
        index = index + 1
     #listener.write_video('test_box.mp4', 'test_label.mp4')
